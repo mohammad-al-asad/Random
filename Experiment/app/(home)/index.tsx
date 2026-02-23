@@ -1,9 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import { View, Text, StyleSheet, Dimensions, Platform } from "react-native";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  Dimensions,
+  Platform,
+  Pressable,
+} from "react-native";
 import Svg, { Rect, Text as SvgText, G } from "react-native-svg";
+import { useRouter } from "expo-router";
+import * as ImagePicker from "expo-image-picker";
 import {
   Camera,
   useCameraDevice,
+  useCameraFormat,
   useCameraPermission,
   useFrameProcessor,
 } from "react-native-vision-camera";
@@ -28,9 +38,14 @@ const LABELS = [
 const INPUT_SIZE = 640;
 const NUM_CLASSES = 11;
 const NUM_CANDIDATES = 8400;
-const INFERENCE_INTERVAL_MS = 300;
+const TARGET_INFERENCE_FPS = 1;
+const INFERENCE_INTERVAL_MS = 2000 / TARGET_INFERENCE_FPS;
+const TARGET_OVERLAY_FPS = 8;
+const OVERLAY_INTERVAL_MS = 1000 / TARGET_OVERLAY_FPS;
+const MAX_RENDER_DETS = 5;
+const CAMERA_FPS = 30;
 
-const CONF_THR = 0.15;
+const CONF_THR = 0.50;
 const IOU_THR = 0.45;
 
 type Det = {
@@ -206,10 +221,11 @@ function mapToScreen(
 ): Det[] {
   if (frameW <= 0 || frameH <= 0) return [];
 
-  // resize-plugin center-crops frame to square before scaling to INPUT_SIZE.
-  const cropSize = Math.min(frameW, frameH);
-  const cropX = (frameW - cropSize) / 2;
-  const cropY = (frameH - cropSize) / 2;
+  const isSquareFrame = frameW === frameH;
+  // If the camera stream is already square, avoid extra crop calculations.
+  const cropSize = isSquareFrame ? frameW : Math.min(frameW, frameH);
+  const cropX = isSquareFrame ? 0 : (frameW - cropSize) / 2;
+  const cropY = isSquareFrame ? 0 : (frameH - cropSize) / 2;
 
   const uprightSize = getUprightFrameSize(frameW, frameH, orientation);
   const previewScale = Math.max(
@@ -257,14 +273,50 @@ function mapToScreen(
   });
 }
 
+function limitDetections(dets: Det[], maxCount: number): Det[] {
+  "worklet";
+  const sorted = [...dets].sort((a, b) => b.score - a.score);
+  const nonPerson: Det[] = [];
+  const persons: Det[] = [];
+
+  for (const det of sorted) {
+    if (det.label === "person") {
+      persons.push(det);
+    } else {
+      nonPerson.push(det);
+    }
+  }
+
+  return [...nonPerson, ...persons].slice(0, maxCount);
+}
+
+function toImageUri(pathOrUri: string): string {
+  if (pathOrUri.startsWith("file://")) return pathOrUri;
+  if (pathOrUri.startsWith("content://")) return pathOrUri;
+  return `file://${pathOrUri}`;
+}
+
 export default function LiveDetectScreen() {
-  const device = useCameraDevice("back");
+  const router = useRouter();
+  const cameraRef = useRef<Camera>(null);
+  const [cameraFacing, setCameraFacing] = useState<"back" | "front">("back");
+  const backDevice = useCameraDevice("back");
+  const frontDevice = useCameraDevice("front");
+  const device = cameraFacing === "back" ? backDevice : frontDevice;
+  const format = useCameraFormat(device, [
+    { videoAspectRatio: 1 },
+    { videoResolution: { width: INPUT_SIZE, height: INPUT_SIZE } },
+    { fps: CAMERA_FPS },
+  ]);
   const { hasPermission, requestPermission } = useCameraPermission();
   const { resize } = useResizePlugin();
 
   const [model, setModel] = useState<TensorflowModel | null>(null);
   const [dets, setDets] = useState<Det[]>([]);
+  const [isNavigating, setIsNavigating] = useState(false);
+  const canFlipCamera = Boolean(backDevice && frontDevice);
   const lastRunMs = useSharedValue(0);
+  const lastOverlayMs = useSharedValue(0);
 
   const { width: screenW, height: screenH } = Dimensions.get("window");
   const sendDetectionsToJs = useRunOnJS(
@@ -292,6 +344,16 @@ export default function LiveDetectScreen() {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
+  useEffect(() => {
+    if (cameraFacing === "back" && !backDevice && frontDevice) {
+      setCameraFacing("front");
+      return;
+    }
+    if (cameraFacing === "front" && !frontDevice && backDevice) {
+      setCameraFacing("back");
+    }
+  }, [cameraFacing, backDevice, frontDevice]);
+
   const ready = useMemo(() => model !== null, [model]);
 
   const frameProcessor = useFrameProcessor(
@@ -316,10 +378,64 @@ export default function LiveDetectScreen() {
 
       const out = toFloatArray(outputs[0]);
       const parsed = postprocess(out);
-      sendDetectionsToJs(parsed, frame.width, frame.height, frame.orientation);
+      const limited = limitDetections(parsed, MAX_RENDER_DETS);
+
+      if (now - lastOverlayMs.value < OVERLAY_INTERVAL_MS) return;
+      lastOverlayMs.value = now;
+      sendDetectionsToJs(limited, frame.width, frame.height, frame.orientation);
     },
-    [model, resize, lastRunMs, sendDetectionsToJs],
+    [model, resize, lastRunMs, lastOverlayMs, sendDetectionsToJs],
   );
+
+  const goToResult = (imageUri: string) => {
+    router.push({
+      pathname: "/(home)/result",
+      params: {
+        imageUri,
+      },
+    });
+  };
+
+  const onToggleFacing = () => {
+    if (!canFlipCamera) return;
+    setCameraFacing((prev) => (prev === "back" ? "front" : "back"));
+  };
+
+  const onCapture = async () => {
+    if (!cameraRef.current || isNavigating) return;
+    setIsNavigating(true);
+    try {
+      const photo = await cameraRef.current.takePhoto();
+      goToResult(toImageUri(photo.path));
+    } catch (error) {
+      console.warn("capture_failed", error);
+    } finally {
+      setIsNavigating(false);
+    }
+  };
+
+  const onPickImage = async () => {
+    if (isNavigating) return;
+    setIsNavigating(true);
+    try {
+      const permission =
+        await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) return;
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+        quality: 1,
+      });
+      if (result.canceled || !result.assets.length) return;
+
+      goToResult(result.assets[0].uri);
+    } catch (error) {
+      console.warn("pick_image_failed", error);
+    } finally {
+      setIsNavigating(false);
+    }
+  };
 
   if (!device) {
     return (
@@ -345,13 +461,25 @@ export default function LiveDetectScreen() {
     );
   }
 
+  if (!format) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.txt}>Preparing camera format...</Text>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
       <Camera
+        ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={true}
         frameProcessor={frameProcessor}
+        photo={true}
+        format={format}
+        fps={CAMERA_FPS}
       />
 
       <View style={styles.topPill}>
@@ -399,6 +527,35 @@ export default function LiveDetectScreen() {
           );
         })}
       </Svg>
+
+      <View style={styles.controlsWrap}>
+        <Pressable
+          style={[styles.pickButton, isNavigating && styles.btnDisabled]}
+          onPress={onPickImage}
+          disabled={isNavigating}
+        >
+          <Text style={styles.pickButtonText}>Pick</Text>
+        </Pressable>
+
+        <Pressable
+          style={[styles.captureOuter, isNavigating && styles.btnDisabled]}
+          onPress={onCapture}
+          disabled={isNavigating}
+        >
+          <View style={styles.captureInner} />
+        </Pressable>
+
+        <Pressable
+          style={[
+            styles.facingButton,
+            (!canFlipCamera || isNavigating) && styles.btnDisabled,
+          ]}
+          onPress={onToggleFacing}
+          disabled={!canFlipCamera || isNavigating}
+        >
+          <Text style={styles.facingButtonText}>Flip</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -436,5 +593,64 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     letterSpacing: 0.6,
     fontSize: 12,
+  },
+  controlsWrap: {
+    position: "absolute",
+    bottom: Platform.select({ ios: 30, android: 24, default: 24 }),
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 26,
+  },
+  pickButton: {
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    borderWidth: 2,
+    borderColor: "white",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pickButtonText: {
+    color: "white",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  captureOuter: {
+    width: 82,
+    height: 82,
+    borderRadius: 41,
+    borderWidth: 4,
+    borderColor: "white",
+    backgroundColor: "rgba(255,255,255,0.2)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  captureInner: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: "white",
+  },
+  facingButton: {
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    borderWidth: 2,
+    borderColor: "white",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  facingButtonText: {
+    color: "white",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  btnDisabled: {
+    opacity: 0.6,
   },
 });
